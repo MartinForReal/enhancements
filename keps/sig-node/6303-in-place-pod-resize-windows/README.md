@@ -83,42 +83,70 @@ existing live-update path run on Windows.
 
 ## Motivation
 
-In-place pod vertical scaling lets vertical pod autoscalers and operators change a running
-container CPU and memory requests and limits without recreating the Pod or restarting the
-container. It is a stable feature for Linux workloads, used with VPA in-place updates. Windows
-nodes are excluded solely because of the hard-coded rejection in the kubelet gate; the
-underlying runtime (containerd on Windows, backed by HCS job objects) supports updating live
-resource limits for containers, and KEP-1287 explicitly intended UpdateContainerResources to
-work for Windows containers:
+Windows workers are excluded from in-place pod vertical scaling solely because the kubelet
+hard-rejects every resize through a hand-written per-OS gate (pkg/kubelet/allocation/
+features_windows.go). The underlying runtime (containerd on Windows, backed by HCS job
+objects) already supports updating live resource limits for containers, and KEP-1287
+explicitly intended UpdateContainerResources to work for Windows:
 
 > "Modify UpdateContainerResources to allow it to work for Windows Containers, as well as
 > Containers managed by other runtimes besides Linux." -- KEP-1287
 
 That goal was never wired into the Windows kubelet. The parity gap is user-visible: Windows
-workloads cannot use in-place VPA, StatefulSet updates, or Job autoscaling without Pod
-recreation and container restarts.
+workloads cannot apply CPU or memory resize to a running container without Pod recreation
+and container restarts. This KEP closes that gap. Its primary motivations are:
+
+- **On-line CPU vertical scaling.** Raise or lower a running Windows container's CPU count /
+  quota (`cpuMaximum`, shares) without restarting it. Vertical pod autoscalers and operators can
+  right-size CPU in place on Windows exactly as on Linux.
+- **Commit-ceiling memory resize without container restart.** A Windows memory limit is
+  not a kill: the HCS job object enforces a working-set limit (soft; induces working-set
+  trimming) plus a commit ceiling (hard; surfaced as an allocation failure). Unlike Linux
+  there is **no native OOM killer** that terminates the container. Changing
+  `resources.memory.limit` in place moves that commit ceiling and working-set limit
+  without a restart, so operators can adjust memory headroom for in-place-growing workloads
+  such as .NET or Go services without dropping connections.
+- **Resource and QoS consistency.** Keeping accounting, the scheduler, and the eviction manager
+  in step with the limits actually enforced on the Windows node avoids drift between what is
+  scheduled and what is applied, and keeps QoS semantics credible for Windows pods.
+- **Operational convenience.** VPA in-place updates, StatefulSet resizes, and Job autoscaling
+  become usable on Windows node pools, removing the recreate-and-restart tax and the resulting
+  connection and state churn.
+
+The enabler is unchanged from Linux: the CRI `UpdateContainerResources` (and the
+pod-sandbox-level call) plus the existing feature-gate path (`InPlacePodVerticalScaling` /
+`InPlacePodLevelResourcesVerticalScaling`), now honored by the
+Windows kubelet. How the commit ceiling and memory limit map to HCS job objects is
+detailed in Design Details.
 
 ### Goals
 
-- Enable container-level in-place vertical scaling (resize of cpu/memory requests and limits)
-  on Windows nodes, matching Linux behavior.
-- Make the Windows kubelet honor the InPlacePodVerticalScaling feature-gate path instead of
-  hard-rejecting resize.
-- Define and implement Windows-specific resource-update semantics:
-  - memory applied as a working-set limit (HCS compute-system memory limit via job objects),
-    differing from Linux cgroup semantics;
-  - CPU updates mapping requested resources to the Windows CPU-share model.
-- Follow the KEP-1287 CRI contract so no breaking CRI API change is introduced in the
-  container-level scope.
+- Enable container-level in-place vertical scaling (resize of cpu and memory requests/limits)
+  on Windows nodes, matching Linux behavior, without recreating the Pod or restarting the
+  container.
+- Provide on-line CPU vertical scaling by mapping a container's CPU request/limits to the
+  Windows CPU-share/affinity model through `UpdateContainerResources`.
+- Provide in-place memory sizing on the commit ceiling: lower or raise the working-set limit
+  and commit ceiling enforced by the Windows runtime without container restart, documented as
+  distinct from Linux cgroup `memory.max` enforcement (no native OOM kill on Windows).
+- Make the Windows kubelet honor the `InPlacePodVerticalScaling` feature-gate path instead
+  of hard-rejecting resize.
+- Resolve CRI `UpdateContainerResources` / `UpdatePodSandbox` on Windows so accounting,
+  scheduler, and eviction agree with the enforced limits.
+- Keep the KEP-1287 CRI contract so no breaking CRI change is introduced in the container-level
+  scope.
 
 ### Non-Goals
+
 - Changing the PodSpec Resources API or QoS-class semantics.
 - In-place vertical scaling for Hyper-V isolated pods in the Alpha milestone (initial scope
   targets process-isolated Windows containers).
 - Any change to the Linux path.
-- General memory OOM parity (working-set vs commit) belongs to the separate Windows memory-parity
-  workstream.
-- Pod-level resources on Windows in Alpha; it follows in the Beta milestone.
+- Reproducing Linux-memcg OOM-kill semantics on Windows, or full "OOM parity" between
+  working-set trimming and cgroup `memory.max`: Windows enforces working-set trim
+  plus commit-ceiling allocation failure (no native kill), and that divergence is documented
+  rather than hidden.
+- Pod-level-resource resize on Windows in Alpha; it follows in the Beta milestone.
 
 ## Proposal
 
@@ -343,4 +371,3 @@ pairings degrade gracefully on either OS.
 
 A Windows CI job that runs the new in-place resize e2e persistently in the sig-windows periodic
 suite; existing jobs may need a new profile entry.
-
