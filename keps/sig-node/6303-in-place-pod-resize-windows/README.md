@@ -29,9 +29,9 @@
     - [Integration tests](#integration-tests)
     - [e2e tests (Windows)](#e2e-tests-windows)
   - [Graduation Criteria](#graduation-criteria)
-    - [Alpha](#alpha)
-    - [Beta](#beta)
-    - [GA](#ga)
+    - [Alpha (v1.38)](#alpha-v138)
+    - [Beta (v1.39)](#beta-v139)
+    - [GA (v1.41)](#ga-v141)
   - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
   - [Version Skew Strategy](#version-skew-strategy)
 - [Production Readiness Review Questionnaire](#production-readiness-review-questionnaire)
@@ -192,15 +192,29 @@ runtime because Linux-only dependencies return nil on non-Linux builds:
 2. generateUpdatePodSandboxResourcesRequest (kuberuntime_container_windows.go) returns nil for the pod-level
    sandbox update.
 
-For container-level resize (the Alpha scope), resolve this by programming a non-nil Windows
-ResourceConfigForPod that reflects only what the CRI (HCS) update path can enforce (WindowsContainerResources:
-CPU CpuMaximum and memory commit limit derived from container resources), bypassing cgroup-only fields; and, for
-the pod-level sandbox update, treat it as best-effort so the container-level resize proceeds.
+Making ResourceConfigForPod non-nil alone is not sufficient: even when it returns a value, the shared
+doPodResizeAction reads and dereferences cgroup-only fields unconditionally. Specifically (kuberuntime_manager.go):
 
-Partial updates and actuated state: after a successful UpdateContainerResources the kubelet calls
-setActuatedContainerResources; on Windows it records the actuated CPU maximum and memory commit limit actually
-applied, not the pod-level aggregate, so accounting does not drift. Controller retries converge idempotently
-against the runtime path.
+- it reads pod cgroup configuration via PodContainerManager.GetPodCgroupConfig for memory and CPU,
+- in the CPU leg it rejects a missing podResources.CPUShares (fails the resize when nil) and dereferences
+  currentPodCPUConfig.CPUQuota / podResources.CPUQuota / CPUShares into resizeContainers,
+- the cm.ResourceConfig type (pkg/kubelet/cm/types.go) has no CpuMaximum field at all,
+none of which exist or are meaningful on Windows (no cgroups), so populating only HCS-enforceable fields and making
+the pod sandbox update best-effort still leaves CPU container updates reaching the cgroup dereference.
+
+The Alpha change therefore adds a Windows-specific branch (or platform abstraction) in the resize path that,
+for a Windows node, bypasses the cgroup-config read, the CPUShares nil-check and the CPUQuota/CPUShares dereference,
+and instead builds the desired WindowsContainerResources directly from the container resources via
+calculateWindowsResources here and performs the container update. The Windows branch must preserve the guarantees
+that the shared path provides on Linux:
+- container-update ordering and the under-gate failure -> event reason (not a hard gate rejection),
+- the memory-decrease safety check (see Memory Limit Enforcement on Windows),
+- actuated-resource tracking through setActuatedContainerResources.
+
+Partial updates and actuated state: after a successful UpdateContainerResources on the Windows branch, the kubelet
+calls setActuatedContainerResources and records the actuated CPU maximum and memory commit limit actually applied
+(not the pod-level aggregate) so accounting does not drift; controller retries converge idempotently against the
+runtime path.
 
 ### CRI Resource Update for Windows Containers
 
@@ -241,10 +255,15 @@ This is distinct from Linux cgroup memory.max (an OOM kill) and from working-set
 
 - sets WindowsContainerResources.MemoryLimitInBytes directly to resources.limits.memory — the commit cap — the same
   field used at creation; no new enforcement mechanism,
-- documents that decreasing the limit cannot reclaim already-committed memory: if committed usage exceeds the new cap,
-  subsequent allocation fails and the container may become unhealthy,
+- preserves the existing memory-decrease safety check: the shared validator rejects a new limit that is at or
+  below the current committed usage before the runtime is called, so a requested decrease that would be unsafe is
+  NOT applied. The lower cap stays at its previous value and is retried on subsequent reconciles until committed
+  usage falls below the requested limit,
+- documents that a successfully applied decrease reclaims nothing already committed: if committed usage later grows
+  into the (smaller) cap, the next allocation fails and the container may become unhealthy — the operator is told
+  this at apply time rather than the resize being force-applied,
 - removes the proposed WindowsWorkingSetLimitApplied event; instead it emits WindowsMemoryLimitApplied reporting the
-  commit cap actually enforced, so operators can troubleshoot allocation failures.
+  commit cap actually enforced, which aids allocation-failure troubleshooting.
 
 ### Test Plan
 
@@ -256,7 +275,7 @@ This is distinct from Linux cgroup memory.max (an OOM kill) and from working-set
 - kubelet/kuberuntime: calculateWindowsResources is reused for the update (CPU CpuMaximum mapping, memory commit
   cap); limit-only resize of a running finite-CPU-limit container; CPU request does not become a weight.
 - Update generates correct WindowsContainerResources for CPU/memory decrease and increase and preserves the
-  CpuCount/CpuMaximum mutual exclusion.
+  CpuCount/CpuMaximum mutual exclusion; validator keeps a below-usage memory decrease unapplied until usage permits.
 
 #### Integration tests
 - test/integration/kubelet: a Windows node honors the resize flow without restart and records actuated resources.
@@ -266,7 +285,10 @@ This is distinct from Linux cgroup memory.max (an OOM kill) and from working-set
 - InPlacePodVerticalScaling Windows: increase and decrease CPU (CpuMaximum) and memory limit on a running Windows
   container without restart.
 - Resize a running container created with a finite CPU limit (no CpuMaximum+CpuWeight mutual-exclusion error).
-- Memory-decrease test that surfaces the allocation failure on a container over the new cap.
+- Memory-limit decrease when committed usage is already at/above the requested value is safely rejected by
+  the validator (limit stays at the previous value, resize retried) - verify no under-gate force-apply occurs.
+- Memory-limit decrease to a value strictly above current committed usage succeeds; afterwards, allocating beyond
+  the (now smaller) applied cap surfaces the documented allocation failure / container-unhealthy behavior.
 - Process-isolated Windows containers are the initial scope; Hyper-V is a follow-up.
 - Run in the periodic SIG-Windows conformance jobs with a two-week stability window before alpha.
 
@@ -274,8 +296,8 @@ This is distinct from Linux cgroup memory.max (an OOM kill) and from working-set
 
 #### Alpha (v1.38)
 - New WindowsInPlacePodResize gate (off by default), disable-supported.
-- Container-level CPU (CpuMaximum) and memory commit resize works for a process-isolated container; the Windows
-  reconciliation path no longer aborts on nil ResourceConfigForPod.
+- Container-level CPU (CpuMaximum) and memory commit resize works for a process-isolated container via the
+  Windows-specific reconciliation branch that bypasses the cgroup-only CPUShares/CPUQuota requirements.
 - Gate-off / gate-on behavior and event reason covered; e2e stable two weeks.
 #### Beta (v1.39)
 - Gate default flips on (with SIG sign-off); pod-level (Always) resize on Windows.
@@ -349,6 +371,9 @@ resize policies are actively issuing there.
   uses CpuMaximum, not shares; (3) Windows resize reconciliation path for the nil ResourceConfigForPod and sandbox
   update; (4) memory described as a job-object commit cap, not working-set, with the event renamed and allocation-failure
   behavior defined.
+- 2026-09-09 (b): second review pass - add a Windows-specific branch to bypass cgroup CPUShares/CPUQuota requirements in
+  the reconciliation path; preserve the resize validator so a below-usage memory decrease stays unapplied and is retried;
+  regenerate the table of contents (alpha-v138 / beta-v139 / ga-v141 anchors).
 - Tracking issue: kubernetes/enhancements#6303.
 
 ## Drawbacks
