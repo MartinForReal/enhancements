@@ -23,6 +23,7 @@
   - [CRI Resource Update for Windows Containers](#cri-resource-update-for-windows-containers)
   - [Working-Set vs Commit Memory Semantics](#working-set-vs-commit-memory-semantics)
   - [CPU Resource Update](#cpu-resource-update)
+  - [Windows Resource Semantics vs Linux](#windows-resource-semantics-vs-linux)
   - [Pod-Level Resources](#pod-level-resources)
   - [Test Plan](#test-plan)
     - [Unit tests](#unit-tests)
@@ -245,6 +246,21 @@ UpdateContainerResources. Where the CPU affinity gate is enabled on Windows node
 path must stay consistent with the affinity engine; the WindowsCPUAndMemoryAffinity gate itself
 is out of scope here.
 
+### Windows Resource Semantics vs Linux
+
+The Windows implementation maps the Linux-oriented CRI resource message onto HCS primitives.
+Consumers should observe the same eventual outcome (a resized, running container) while the
+underlying enforcement differs:
+
+| Resource | Linux (cgroup v2)            | Windows (HCS job object)              | Notes |
+|----------|------------------------------|---------------------------------------|-------|
+| cpu.requests / cpu.limits | CFS quota + period; cpuset affinity | CPU share count (relative weight) | conversions done in kuberuntime ; affinity gate is separate |
+| memory.limit | memory.max (cold-group)     | working-set limit on the job object   | OOM semantics differ; see below |
+| memory.max / commit vs working | commit memory accounting  | working set (committed+resident equiv.) | divergence recorded on apply |
+
+The kubelet emits a per-resize event with the resolved CPU share and memory working-set values so
+operators can correlate what was requested with what was enforced on Windows.
+
 ### Pod-Level Resources
 
 Pod-level in-place resize is supported only when restartPolicy is Always and containers can be
@@ -314,6 +330,13 @@ pairings degrade gracefully on either OS.
   when disabled the Windows kubelet mirrors the current behavior (rejects resize).
 - No new API object is introduced; the feature is runtime-capability facing.
 - Disabling causes no effect beyond refusing resize; no data is mutated.
+- **Does enabling change default behavior?** Yes, but only when the gate is on and the runtime
+  reports live-update capability; otherwise behavior is unchanged from today (resize refused).
+- **What happens if we re-enable after rollback?** A fresh kubelet start re-arms the gate; no
+  migration or state replay is needed because nothing is persisted beyond the existing pod
+  status fields.
+- **Enable/disable tests:** the unit tests flip the gate and assert the Windows kubelet accepts
+  or refuses accordingly; the e2e runs with the gate on.
 
 ### Rollout, Upgrade and Rollback Planning
 
@@ -327,6 +350,15 @@ pairings degrade gracefully on either OS.
   observe accepted vs refused resize on Windows nodes.
 - Emit a kubelet event reason (WindowsWorkingSetLimitApplied) when a working-set limit is
   applied, which assists OOM-path debugging.
+**SLI:** `kubelet_inplace_pod_resize_total{os="windows",outcome="success|refused"}` and the
+per-resize event latency are the primary signals that in-place resize is functioning on a node.
+
+**SLO (alpha/beta):** successful-apply rate derived from the SLI is maintained at >= 99.9% on
+the Windows conformance / readiness e2e over the pre-release two-week stability window, with no
+open flake-only failures in the SIG-Windows testgrid.
+
+**In-use signal for operators:** `rate(kubelet_inplace_pod_resize_total{os="windows"}[5m]) > 0`
+on a node-pool indicates vertical-scaling (VPA in-place / HPA) is actively issuing resizes there.
 
 ### Dependencies
 
@@ -349,6 +381,8 @@ pairings degrade gracefully on either OS.
 
 - 2026-08-21: Initial provisional draft submitted. Authored with AI assistance; the human author
   remains responsible for the content.
+- 2026-08-31: Review-feedback enrichment pass - expand PRR with SLI/SLO and enable/disable
+  Q&As, and add a Windows-vs-Linux resource-semantics mapping table in Design Details.
 - Tracking issue: kubernetes/enhancements#6303 (this is the KEP number).
 
 ## Drawbacks

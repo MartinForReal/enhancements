@@ -41,7 +41,7 @@ feature-gates:
       - kube-apiserver
       - kube-scheduler
       - kubelet
-disable-supported: false
+disable-supported: true
 
 metrics:
   - kubelet_inplace_pod_resize_total
