@@ -15,16 +15,15 @@
 - [Proposal](#proposal)
   - [User Stories](#user-stories)
     - [Story 1: VPA in-place mode on a Windows StatefulSet](#story-1-vpa-in-place-mode-on-a-windows-statefulset)
-    - [Story 2: One feature gate across mixed-OS node pools](#story-2-one-feature-gate-across-mixed-os-node-pools)
+    - [Story 2: A disabled-by-default Windows gate](#story-2-a-disabled-by-default-windows-gate)
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [Kubelet Gating Changes](#kubelet-gating-changes)
+  - [Windows Resize Reconciliation Path](#windows-resize-reconciliation-path)
   - [CRI Resource Update for Windows Containers](#cri-resource-update-for-windows-containers)
-  - [Working-Set vs Commit Memory Semantics](#working-set-vs-commit-memory-semantics)
   - [CPU Resource Update](#cpu-resource-update)
-  - [Windows Resource Semantics vs Linux](#windows-resource-semantics-vs-linux)
-  - [Pod-Level Resources](#pod-level-resources)
+  - [Memory Limit Enforcement on Windows](#memory-limit-enforcement-on-windows)
   - [Test Plan](#test-plan)
     - [Unit tests](#unit-tests)
     - [Integration tests](#integration-tests)
@@ -68,86 +67,55 @@
 
 ## Summary
 
-In-place pod vertical scaling (the InPlacePodVerticalScaling feature gate, defined in
-KEP-1287, see keps/sig-node/1287-in-place-update-pod-resources) is stable on Linux, but the
-kubelet hard-rejects resource resize on Windows nodes. Every resize attempt on Windows is
-refused with the message "In-place pod resize is not supported on Windows" by the hand-written
-per-OS gate in pkg/kubelet/allocation/features_windows.go (functions
-IsInPlacePodVerticalScalingAllowed and IsInPlacePodLevelResourcesVerticalScalingAllowed).
+In-place pod vertical scaling (InPlacePodVerticalScaling, KEP-1287) is GA and default-on on
+Linux, but the Windows kubelet hard-rejects every resource resize with the message In-place
+pod resize is not supported on Windows, from the per-OS gate in
+pkg/kubelet/allocation/features_windows.go (IsInPlacePodVerticalScalingAllowed and
+IsInPlacePodLevelResourcesVerticalScalingAllowed).
 
-This KEP removes that gap. It makes the Windows kubelet honor the same feature-gate path used
-on Linux and implements the CRI UpdateContainerResources / UpdatePodSandbox resource-update
-path for Windows containers (Host Compute Service / HCS job objects). The PodSpec Resources API
-is already GA; no API change is required. The change is confined to the kubelet and the Windows
-container runtimes; containerd needs no CRI schema change for the initial scope, only its
-existing live-update path run on Windows.
+This KEP removes that gap. It adds a new, disable-aware Alpha feature gate (WindowsInPlacePodResize)
+that controls accepting the existing Linux-GA InPlacePodVerticalScaling feature on Windows, and
+implements the CRI UpdateContainerResources live-update path for Windows containers using the exact
+CPU (CpuMaximum) and memory (commit cap) semantics the Windows kubelet already applies at container
+creation. The change is confined to the kubelet Windows build; behavior is unchanged when the new gate
+is off.
 
 ## Motivation
 
-Windows workers are excluded from in-place pod vertical scaling solely because the kubelet
-hard-rejects every resize through a hand-written per-OS gate (pkg/kubelet/allocation/
-features_windows.go). The underlying runtime (containerd on Windows, backed by HCS job
-objects) already supports updating live resource limits for containers, and KEP-1287
-explicitly intended UpdateContainerResources to work for Windows:
+Windows workers are excluded from in-place pod vertical scaling only because the kubelet hard-rejects
+every resize through a hand-written per-OS gate. The runtime (containerd on Windows, backed by HCS
+job objects) already supports updating live resource limits for containers, and KEP-1287 explicitly
+intended UpdateContainerResources, the CRI update call, to work for Windows. That goal was never wired
+into the Windows kubelet, and several shared resize-pipeline pieces today abort on Windows (see Windows
+Resize Reconciliation Path). Closing the gap enables:
 
-> "Modify UpdateContainerResources to allow it to work for Windows Containers, as well as
-> Containers managed by other runtimes besides Linux." -- KEP-1287
-
-That goal was never wired into the Windows kubelet. The parity gap is user-visible: Windows
-workloads cannot apply CPU or memory resize to a running container without Pod recreation
-and container restarts. This KEP closes that gap. Its primary motivations are:
-
-- **On-line CPU vertical scaling.** Raise or lower a running Windows container's CPU count /
-  quota (`cpuMaximum`, shares) without restarting it. Vertical pod autoscalers and operators can
-  right-size CPU in place on Windows exactly as on Linux.
-- **Commit-ceiling memory resize without container restart.** A Windows memory limit is
-  not a kill: the HCS job object enforces a working-set limit (soft; induces working-set
-  trimming) plus a commit ceiling (hard; surfaced as an allocation failure). Unlike Linux
-  there is **no native OOM killer** that terminates the container. Changing
-  `resources.memory.limit` in place moves that commit ceiling and working-set limit
-  without a restart, so operators can adjust memory headroom for in-place-growing workloads
-  such as .NET or Go services without dropping connections.
-- **Resource and QoS consistency.** Keeping accounting, the scheduler, and the eviction manager
-  in step with the limits actually enforced on the Windows node avoids drift between what is
-  scheduled and what is applied, and keeps QoS semantics credible for Windows pods.
-- **Operational convenience.** VPA in-place updates, StatefulSet resizes, and Job autoscaling
-  become usable on Windows node pools, removing the recreate-and-restart tax and the resulting
-  connection and state churn.
-
-The enabler is unchanged from Linux: the CRI `UpdateContainerResources` (and the
-pod-sandbox-level call) plus the existing feature-gate path (`InPlacePodVerticalScaling` /
-`InPlacePodLevelResourcesVerticalScaling`), now honored by the
-Windows kubelet. How the commit ceiling and memory limit map to HCS job objects is
-detailed in Design Details.
+- On-line CPU vertical scaling: raise or lower a running Windows container CPU maximum (CpuMaximum)
+  without restart.
+- Commit-cap memory resize without restart: a Windows memory limit is a job-object commit cap
+  (JOB_OBJECT_LIMIT_JOB_MEMORY) surfaced as an allocation failure, moved in place by updating
+  resources.memory.limit.
+- Resource and OS-consistency so scheduler, eviction, and accounting match enforced values.
+- Operational convenience for VPA in-place and StatefulSet resizes on Windows node pools.
 
 ### Goals
 
-- Enable container-level in-place vertical scaling (resize of cpu and memory requests/limits)
-  on Windows nodes, matching Linux behavior, without recreating the Pod or restarting the
-  container.
-- Provide on-line CPU vertical scaling by mapping a container's CPU request/limits to the
-  Windows CPU-share/affinity model through `UpdateContainerResources`.
-- Provide in-place memory sizing on the commit ceiling: lower or raise the working-set limit
-  and commit ceiling enforced by the Windows runtime without container restart, documented as
-  distinct from Linux cgroup `memory.max` enforcement (no native OOM kill on Windows).
-- Make the Windows kubelet honor the `InPlacePodVerticalScaling` feature-gate path instead
-  of hard-rejecting resize.
-- Resolve CRI `UpdateContainerResources` / `UpdatePodSandbox` on Windows so accounting,
-  scheduler, and eviction agree with the enforced limits.
-- Keep the KEP-1287 CRI contract so no breaking CRI change is introduced in the container-level
-  scope.
+- Container-level CPU and memory in-place resize on Windows without Pod recreation or container restart.
+- Reuse existing Windows creation-time semantics (CpuMaximum for CPU limits, job commit cap for the
+  memory limit) so a resize never changes what creation enforces.
+- Introduce a Windows Alpha gate (WindowsInPlacePodResize) toggled independently of the locked, GA
+  InPlacePodVerticalScaling gate.
+- Specify and implement the Windows path through the shared resize reconciliation pipeline that
+  aborts on Windows today.
 
 ### Non-Goals
 
 - Changing the PodSpec Resources API or QoS-class semantics.
-- In-place vertical scaling for Hyper-V isolated pods in the Alpha milestone (initial scope
-  targets process-isolated Windows containers).
+- In-place vertical scaling for Hyper-V isolated pods in Alpha (initial scope is process-isolated
+  Windows containers).
 - Any change to the Linux path.
-- Reproducing Linux-memcg OOM-kill semantics on Windows, or full "OOM parity" between
-  working-set trimming and cgroup `memory.max`: Windows enforces working-set trim
-  plus commit-ceiling allocation failure (no native kill), and that divergence is documented
-  rather than hidden.
-- Pod-level-resource resize on Windows in Alpha; it follows in the Beta milestone.
+- Reproducing Linux OOM-kill semantics on Windows: the Windows commit cap surfaces allocation failures,
+  documented rather than hidden.
+- Pod-level-resource resize on Windows in Alpha; it moves to the Beta milestone.
 
 ## Proposal
 
@@ -155,253 +123,248 @@ detailed in Design Details.
 
 #### Story 1: VPA in-place mode on a Windows StatefulSet
 
-A Windows-hosted .NET workload is scaled by the Vertical Pod Autoscaler in in-place mode. Today
-every resource update forces a Pod recreation, dropping connections and buffered writes. After
-this KEP the VPA can resize requests and limits live without restarting containers, matching
-the Linux experience.
+A Windows-hosted .NET workload scales CPU and memory live via Vertical Pod Autoscaler in-place mode.
+Today every update forces Pod recreation, dropping connections. After this KEP the VPA can resize
+requests and limits live without restarting containers.
 
-#### Story 2: One feature gate across mixed-OS node pools
+#### Story 2: A disabled-by-default Windows gate
 
-A cluster runs both Linux and Windows node pools behind the same InPlacePodVerticalScaling gate.
-After this KEP the Windows node pool no longer silently refuses resize, so autoscaling policies
-and operators become portable across OS pools.
+A cluster whose Linux nodes run InPlacePodVerticalScaling GA-default-on should not enable that behavior
+on Windows node pools until an admin opts in. The WindowsInPlacePodResize gate (alpha, off by default)
+gives that opt-in and a clean rollback.
 
 ### Notes/Constraints/Caveats
 
-- Windows has no cgroups. Resource enforcement uses the HCS job object exposed through the
-  runtime (containerd); the kubelet abstracts it behind the CRI update path.
-- Memory limits are applied as working-set limits on Windows, not Linux-style commit limits.
-  This can surface different OOM behavior and is recorded rather than hidden (see Design Details).
-- The feature gates InPlacePodVerticalScaling (and the pod-level variant) already exist; no new
-  feature gate is introduced in the Alpha milestone.
+- Windows has no cgroups. Enforcement uses the HCS job object surfaced through the runtime (containerd);
+  the kubelet abstracts it behind the CRI update path.
+- The CRI spec already carries a Windows container-resources message (WindowsContainerResources) with
+  CPU count/maximum and memory-limit fields; the kubelet maps these at creation
+  (kuberuntime_container_windows.go, calculateWindowsResources), and resize reuses that mapping.
+- The Linux gates InPlacePodVerticalScaling and InPlacePodLevelResourcesVerticalScaling are GA default-on
+  and cannot be toggled; they do not gate the Windows alpha feature.
 
 ### Risks and Mitigations
 
-- **Risk:** runtimes may not expose consistent live-update semantics across Windows Server
-  versions.
-  **Mitigation:** probe runtime capability at kubelet start and at resize; fail closed with a
-  clear reason when the runtime reports no live-update support.
-- **Risk:** users assume working-set memory limits behave like memcg commit limits and are
-  surprised by OOM divergence.
-  **Mitigation:** document the mapping, emit an event when a working-set limit is applied, and
-  log the divergence so operators can plan capacity.
-- **Risk:** scope creep into adjacent Windows parity items.
-  **Mitigation:** keep strict non-goals; pod-level resources and OOM observability are fenced to
-  their own follow-ups.
+- Risk: runtimes expose inconsistent live-update semantics across Windows Server versions.
+  Mitigation: probe runtime capability at kubelet start and at each resize; fail closed with a clear
+  reason when the runtime reports no live-update support.
+- Risk: users assume Windows memory behaves like Linux memcg commit (OOM kill).
+  Mitigation: document commit-cap semantics and log the divergence so operators can plan capacity.
+- Risk: scope creep into adjacent Windows parity items.
+  Mitigation: keep strict non-goals; pod-level resources and OOM observability are fenced to their own
+  follow-ups.
 
 ## Design Details
 
 ### Kubelet Gating Changes
 
-On Windows the kubelet currently bypasses feature-gate checks and hard-rejects every resize. The
-change replaces pkg/kubelet/allocation/features_windows.go so that it mirrors the Linux
-behavior: gate on features.InPlacePodVerticalScaling (and the pod-level variant) instead of
-returning false unconditionally, and reflect the runtime actual capability when known.
+Today pkg/kubelet/allocation/features_windows.go bypasses feature-gate checks and hard-rejects every
+resize. The change makes the Windows kubelet honor a new, disable-aware Alpha gate gated on the existing
+Linux gate, and only accepts a resize on Windows when the Windows gate is enabled.
 
 Sketch of the post-change Windows gate:
 
-    // pkg/kubelet/allocation/features_windows.go (after)
-    func IsInPlacePodVerticalScalingAllowed(_ *v1.Pod) (bool, string, string) {
+    // features_windows.go (after)
+    func IsInPlacePodVerticalScalingAllowed(...) (bool, string, string) {
         if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
             return false, "InPlacePodVerticalScaling is disabled", "feature_gate_off"
+        }
+        if !utilfeature.DefaultFeatureGate.Enabled(features.WindowsInPlacePodResize) {
+            return false, "WindowsInPlacePodResize is disabled", "windows_gate_off"
         }
         return true, "", ""
     }
 
-This is the minimal kubelet change; the real parity lives in the runtime update path.
+The existing InPlacePodVerticalScaling gate cannot be a toggle on Windows: it is GA, default-on, and
+LockToDefault since 1.35 and scheduled for removal in 1.38 (the current milestone target). A separate
+disable-supported Windows gate is required so the Alpha can be turned off independently on Windows node
+pools, keeping the documented rollback (gate-flip) implementable and the gate-off default matching current
+behavior. Adding the new gate means the Alpha milestone keeps disable-supported: true.
 
+### Windows Resize Reconciliation Path
+
+The gate change alone is not enough: the shared resize pipeline aborts on Windows before reaching the
+runtime because Linux-only dependencies return nil on non-Linux builds:
+
+1. cm.ResourceConfigForPod (pkg/kubelet/cm/helpers_unsupported.go) returns nil on Windows; doPodResizeAction
+   (pkg/kubelet/kuberuntime/kuberuntime_manager.go) fails the resize with unable-to-get-resource-configuration
+   when it is nil.
+2. generateUpdatePodSandboxResourcesRequest (kuberuntime_container_windows.go) returns nil for the pod-level
+   sandbox update.
+
+For container-level resize (the Alpha scope), resolve this by programming a non-nil Windows
+ResourceConfigForPod that reflects only what the CRI (HCS) update path can enforce (WindowsContainerResources:
+CPU CpuMaximum and memory commit limit derived from container resources), bypassing cgroup-only fields; and, for
+the pod-level sandbox update, treat it as best-effort so the container-level resize proceeds.
+
+Partial updates and actuated state: after a successful UpdateContainerResources the kubelet calls
+setActuatedContainerResources; on Windows it records the actuated CPU maximum and memory commit limit actually
+applied, not the pod-level aggregate, so accounting does not drift. Controller retries converge idempotently
+against the runtime path.
 
 ### CRI Resource Update for Windows Containers
 
-Keep using the existing UpdateContainerResources CRI call (and the pod-sandbox level call used
-when pod-level resources change). The CRI spec already carries a Windows resource message with
-fields for CPU shares/maximum and memory limits plus a pod-level Windows section. The kubelet
-must:
+Keep using the existing CRI UpdateContainerResources and the Windows container-resources message. The kubelet must:
 
-1. populate that message from the requested cpu and memory resources,
-2. invoke the existing UpdateContainerResources call, and
-3. surface the runtime response; an unsupported response becomes a resize failure with an event
-   reason rather than a hard gate rejection.
+1. build the desired WindowsContainerResources from the CPU limit and memory limit using the existing calculation
+   (calculateWindowsResources at kuberuntime_container_windows.go) reused for the update, not a new conversion,
+2. invoke UpdateContainerResources and update the actuated resource record,
+3. surface an under-gate failure as an event reason rather than a hard rejection.
 
-No CRI API addition is strictly required for the container-resource scope. If a follow-up
-(pod-level or runtime-specific) needs a new field it will be a separate CRI change, not a new
-kubelet contract.
-
-### Working-Set vs Commit Memory Semantics
-
-On Windows, memory limits control the container working set through the HCS compute-system
-memory limit (job object). This differs from Linux cgroup v2 memory.max. The implementation
-will:
-
-- preserve the Linux meaning of resources.memory.limit,
-- apply it as the job-object working-set limit on Windows,
-- record an event when the working-set limit is applied so operators understand the divergence,
-- document the OOM divergence in user-facing docs.
+No CRI API addition is required for the container-level scope.
 
 ### CPU Resource Update
 
-Windows CPU sizing uses a share model rather than Linux quota/periods. The implementation converts
-container cpu requests and limits to the Windows CPU share value and submits it through
-UpdateContainerResources. Where the CPU affinity gate is enabled on Windows nodes, the resize
-path must stay consistent with the affinity engine; the WindowsCPUAndMemoryAffinity gate itself
-is out of scope here.
+Windows has no CFS quota/periods. The kubelet deliberately enforces a CPU limit with CpuMaximum (percent,
+1-10000) as a hard cap, and a comment in kuberuntime_container_windows.go (calculateWindowsResources) explains
+why weights (shares) are not used: they are relative and setting a weight alongside a maximum can let the maximum
+be ignored. The proposal therefore does NOT convert limits to shares. On resize:
 
-### Windows Resource Semantics vs Linux
+- Reuse calculateCPUMaximum(cpuLimit, processorCount) to set CpuMaximum from resources.limits.cpu, with the same
+  meaning as creation.
+- A CPU request is not enforced as a cap on Windows and is tracked only for accounting; the resize path records
+  the desired requested value but does not translate it to a weight.
+- CPU count precedence is preserved: when CpuCount is set, it takes precedence over CpuMaximum (Windows
+  mutual-exclusion).
 
-The Windows implementation maps the Linux-oriented CRI resource message onto HCS primitives.
-Consumers should observe the same eventual outcome (a resized, running container) while the
-underlying enforcement differs:
+**Running-container limitation:** containerd preserves existing CPU fields when applying new nonzero values. If a
+container was created with CpuMaximum set, sending additional CPU fields (nonzero CpuCount/CpuWeight) can leave both
+CpuMaximum and CpuWeight set, which hcsshim rejects as mutually exclusive. Resize therefore validates the target of a running container that already has a finite CPU limit so a
+limit-only resize never injects a weight. The e2e includes
+a finite-CPU-limit running container.
 
-| Resource | Linux (cgroup v2)            | Windows (HCS job object)              | Notes |
-|----------|------------------------------|---------------------------------------|-------|
-| cpu.requests / cpu.limits | CFS quota + period; cpuset affinity | CPU share count (relative weight) | conversions done in kuberuntime ; affinity gate is separate |
-| memory.limit | memory.max (cold-group)     | working-set limit on the job object   | OOM semantics differ; see below |
-| memory.max / commit vs working | commit memory accounting  | working set (committed+resident equiv.) | divergence recorded on apply |
+### Memory Limit Enforcement on Windows
 
-The kubelet emits a per-resize event with the resolved CPU share and memory working-set values so
-operators can correlate what was requested with what was enforced on Windows.
+Windows process-isolated containers enforce the memory limit as a commit cap via the job object
+(JOB_OBJECT_LIMIT_JOB_MEMORY), limiting the job's committed memory; an allocation that would exceed the cap fails.
+This is distinct from Linux cgroup memory.max (an OOM kill) and from working-set trimming. The design:
 
-### Pod-Level Resources
-
-Pod-level in-place resize is supported only when restartPolicy is Always and containers can be
-recreated. On Windows this is implemented by recreating the affected containers with the updated
-resources through the existing CRI create path. This milestone wires the container-level path and
-records a planned follow-up (section update plus implementation) for pod-level resize.
+- sets WindowsContainerResources.MemoryLimitInBytes directly to resources.limits.memory — the commit cap — the same
+  field used at creation; no new enforcement mechanism,
+- documents that decreasing the limit cannot reclaim already-committed memory: if committed usage exceeds the new cap,
+  subsequent allocation fails and the container may become unhealthy,
+- removes the proposed WindowsWorkingSetLimitApplied event; instead it emits WindowsMemoryLimitApplied reporting the
+  commit cap actually enforced, so operators can troubleshoot allocation failures.
 
 ### Test Plan
 
 [x] I/we understand the owners of the involved components may require updates to existing tests.
 
 #### Unit tests
-- pkg/kubelet/allocation: Windows build assertions that the feature-gate path is honored instead
-  of the current unconditional rejection.
-- pkg/kubelet/kuberuntime: tests mapping requests and limits to Windows CPU shares and memory
-  working-set values.
+- pkg/kubelet/allocation: Windows build asserts the new WindowsInPlacePodResize gate gates the Windows feature
+  (off=refuse, on=accept) while InPlacePodVerticalScaling stays GA.
+- kubelet/kuberuntime: calculateWindowsResources is reused for the update (CPU CpuMaximum mapping, memory commit
+  cap); limit-only resize of a running finite-CPU-limit container; CPU request does not become a weight.
+- Update generates correct WindowsContainerResources for CPU/memory decrease and increase and preserves the
+  CpuCount/CpuMaximum mutual exclusion.
 
 #### Integration tests
-- test/integration/kubelet: verify a Windows node honors the resize flow and reports success
-  without a restart.
-- test/integration/controlplane: confirm the API surface is unchanged (no control-plane impact).
+- test/integration/kubelet: a Windows node honors the resize flow without restart and records actuated resources.
+- test/integration/controlplane: API surface unchanged.
 
 #### e2e tests (Windows)
-- [sig-windows] InPlacePodVerticalScaling: increase and decrease CPU and memory on a Windows
+- InPlacePodVerticalScaling Windows: increase and decrease CPU (CpuMaximum) and memory limit on a running Windows
   container without restart.
-- Process-isolated Windows containers are the initial scope; the Hyper-V case is a follow-up.
-- Run in the periodic Windows conformance jobs with a stability window before alpha.
+- Resize a running container created with a finite CPU limit (no CpuMaximum+CpuWeight mutual-exclusion error).
+- Memory-decrease test that surfaces the allocation failure on a container over the new cap.
+- Process-isolated Windows containers are the initial scope; Hyper-V is a follow-up.
+- Run in the periodic SIG-Windows conformance jobs with a two-week stability window before alpha.
 
 ### Graduation Criteria
 
-#### Alpha
-- Windows kubelet honors the feature gate (no hard rejection).
-- Container-level CPU and memory resize works for a Windows process-isolated container.
-- A dedicated e2e test runs on a Windows node with no flakes for a two-week window.
-- No known memory limit under- or over-allocation gaps remain open.
-
-#### Beta
-- Pod-level (Always) in-place resize works on Windows.
-- CPU and memory parity with Linux is documented and tested (shares and working-set limit).
-- Observability: metrics, events, and troubleshooting docs complete.
-
-#### GA
-- Conformance e2e for Windows in-place resize is present and passing.
-- A maintained Windows CI job proves stability for more than two weeks.
-- Only the existing feature gates remain; no per-OS default differences.
+#### Alpha (v1.38)
+- New WindowsInPlacePodResize gate (off by default), disable-supported.
+- Container-level CPU (CpuMaximum) and memory commit resize works for a process-isolated container; the Windows
+  reconciliation path no longer aborts on nil ResourceConfigForPod.
+- Gate-off / gate-on behavior and event reason covered; e2e stable two weeks.
+#### Beta (v1.39)
+- Gate default flips on (with SIG sign-off); pod-level (Always) resize on Windows.
+- CPU and memory parity documented and tested (CpuMaximum and commit cap).
+#### GA (v1.41)
+- Conformance e2e for Windows in-place resize present and passing; maintained Windows CI.
 
 ### Upgrade / Downgrade Strategy
 
-No API changes; only kubelet code behind existing feature gates. Rolling upgrade of Windows
-nodes: an old kubelet continues to refuse resize (current behavior) with a clear reason, and a
-new kubelet accepts when the gate is on. Downgrade restores the hard rejection; no on-disk
-state is introduced beyond existing pod status fields.
+The new Windows gate is off by default and disable-supported: on upgrade the feature stays off until enabled;
+downgrade restores the rejection. The InPlacePodVerticalScaling gates are unchanged (GA on Linux). No API change.
 
 ### Version Skew Strategy
 
-The kubelet gate is per-node; the API server and scheduler are unchanged. Version skew between
-the kubelet and the runtime (containerd) is handled by a runtime capability probe: if the runtime
-cannot perform a live update, the kubelet fails the resize with an event, so old and new runtime
-pairings degrade gracefully on either OS.
-
+The kubelet gate is per-node; apiserver/scheduler unchanged. Skew between the kubelet and the runtime (containerd)
+is handled by a runtime capability probe: if it cannot live-update, the kubelet fails with an event, so old and new
+pairings degrade gracefully.
 
 ## Production Readiness Review Questionnaire
 
 ### Feature Enablement and Rollback
 
-- Enabled/disabled with the existing InPlacePodVerticalScaling feature gate on the kubelet;
-  when disabled the Windows kubelet mirrors the current behavior (rejects resize).
-- No new API object is introduced; the feature is runtime-capability facing.
-- Disabling causes no effect beyond refusing resize; no data is mutated.
-- **Does enabling change default behavior?** Yes, but only when the gate is on and the runtime
-  reports live-update capability; otherwise behavior is unchanged from today (resize refused).
-- **What happens if we re-enable after rollback?** A fresh kubelet start re-arms the gate; no
-  migration or state replay is needed because nothing is persisted beyond the existing pod
-  status fields.
-- **Enable/disable tests:** the unit tests flip the gate and assert the Windows kubelet accepts
-  or refuses accordingly; the e2e runs with the gate on.
+- Enabled/disabled with the new WindowsInPlacePodResize feature gate on the kubelet; off by default so Windows
+  matches today's behavior until given.
+- No new API object; runtime-capability facing.
+- Does enabling change default behavior? Yes, only when the Windows gate is on and the runtime supports a live update.
+- What happens if we re-enable after rollback? A fresh kubelet start re-arms the gate; no replay or migration needed.
+- Enable/disable tests: unit tests flip the Windows gate and assert accept/refuse; e2e runs with the gate on.
 
 ### Rollout, Upgrade and Rollback Planning
 
-- The change ships in the kubelet binary (Windows); the API server and scheduler are unaffected.
-- Rollback is a gate flip or a kubelet downgrade; no migration is needed.
+- Ships in the kubelet binary (Windows). Rollback is a gate flip or downgrade; no migration.
 - The e2e must run against every release in the Windows CI.
 
 ### Monitoring Requirements
 
-- Collect kubelet_inplace_pod_resize_total with a label for the OS and outcome, so operators can
-  observe accepted vs refused resize on Windows nodes.
-- Emit a kubelet event reason (WindowsWorkingSetLimitApplied) when a working-set limit is
-  applied, which assists OOM-path debugging.
-**SLI:** `kubelet_inplace_pod_resize_total{os="windows",outcome="success|refused"}` and the
-per-resize event latency are the primary signals that in-place resize is functioning on a node.
+- Collect kubelet_inplace_pod_resize_total with a label for the OS and outcome so operators can observe accepted vs
+  refused resize on Windows nodes.
+- Emit a kubelet event reason (WindowsMemoryLimitApplied) when a memory limit (commit) is applied, for the
+  allocation-failure troubleshooting path.
 
-**SLO (alpha/beta):** successful-apply rate derived from the SLI is maintained at >= 99.9% on
-the Windows conformance / readiness e2e over the pre-release two-week stability window, with no
-open flake-only failures in the SIG-Windows testgrid.
+**SLI:** kubelet_inplace_pod_resize_total{os=windows,outcome=success|refused} and per-resize event latency are the
+primary signals.
 
-**In-use signal for operators:** `rate(kubelet_inplace_pod_resize_total{os="windows"}[5m]) > 0`
-on a node-pool indicates vertical-scaling (VPA in-place / HPA) is actively issuing resizes there.
+**SLO (alpha/beta):** successful-apply rate >= 99.9% on the Windows readiness e2e over the pre-release two-week
+window, with no open flake-only failures in SIG-Windows testgrid.
+
+**In-use signal for operators:** rate(kubelet_inplace_pod_resize_total{os=windows}[5m]) > 0 on a node-pool indicates
+resize policies are actively issuing there.
 
 ### Dependencies
 
-- k8s.io/cri-api (unchanged for the container scope); containerd with an existing Windows
-  UpdateContainerResources implementation. No new third-party dependencies.
+- k8s.io/cri-api (unchanged for container scope); containerd with the existing Windows UpdateContainerResources
+  implementation. No new third-party dependency.
 
 ### Scalability
 
-- No new API objects or control-plane channels. Per-node resize calls are the same as Linux; the
-  existing kubelet rate limit bounds call volume.
+- No new API objects or control-plane channels. Per-node resize calls are the same as Linux; the existing kubelet
+  rate limit bounds call volume.
 
 ### Troubleshooting
 
-- Symptom: resize is refused on a Windows node even when the gate is on.
-  - Check kubelet events for the reason indicating live updates are unsupported by the runtime.
-  - Check kubelet and containerd logs for the UpdateContainerResources failure details.
-  - Confirm the InPlacePodVerticalScaling feature gate is enabled on the node.
+- Resize refused when the gate is on: check kubelet events for runtime capability/unsupported reason; confirm
+  WindowsInPlacePodResize is enabled.
+- Memory limit decrease at/above committed usage: expect allocation failure / unhealthy and the documented event.
 
 ## Implementation History
 
-- 2026-08-21: Initial provisional draft submitted. Authored with AI assistance; the human author
-  remains responsible for the content.
-- 2026-08-31: Review-feedback enrichment pass - expand PRR with SLI/SLO and enable/disable
-  Q&As, and add a Windows-vs-Linux resource-semantics mapping table in Design Details.
-- Tracking issue: kubernetes/enhancements#6303 (this is the KEP number).
+- 2026-08-21: Initial provisional draft. Authored with AI assistance; human author responsible.
+- 2026-09-09: Review-feedback pass addressing four items: (1) new disable-aware Windows Alpha gate; (2) CPU resize
+  uses CpuMaximum, not shares; (3) Windows resize reconciliation path for the nil ResourceConfigForPod and sandbox
+  update; (4) memory described as a job-object commit cap, not working-set, with the event renamed and allocation-failure
+  behavior defined.
+- Tracking issue: kubernetes/enhancements#6303.
 
 ## Drawbacks
 
-- Working-set vs commit memory semantics add platform-specific behavior that needs clear
-  documentation so users are not surprised.
-- A runtime capability-probe path must be kept in parity with the Linux path over time.
+- Adds a Windows-gate knob operators must learn.
+- The commit-cap vs Linux divergence requires documentation.
+- The Windows reconciliation path is new platform plumbing that must stay in parity.
 
 ## Alternatives
 
-- **Just remove the rejection in features_windows.go:** unsafe without runtime capability
-  support; KEP-1287 requires capability detection. Rejected as incomplete.
-- **Extend KEP-1287 in place:** it is already marked implemented and stable; the remaining
-  Windows work is best tracked as a new scoped KEP with clear reviewers, linking to KEP-1287 via
-  see-also.
-- **Candidate B (graduation of WindowsCPUAndMemoryAffinity):** a graduation-only change within
-  an existing enhancement, not a new parity gap; out of scope here and tracked separately.
+- **Just remove the rejection in features_windows.go:** unsafe and ineffective because the pipeline aborts; and a
+  disableable gate is required for alpha. Rejected.
+- **Extend KEP-1287 in place:** already implemented/stable; the remaining Windows work is a new scoped KEP. Rejected.
+- **Gate Windows behind the legacy InPlacePodVerticalScaling gate:** impossible because it is LockToDefault. This is
+  why a new Windows gate is introduced.
 
 ## Infrastructure Needed (Optional)
 
-A Windows CI job that runs the new in-place resize e2e persistently in the sig-windows periodic
-suite; existing jobs may need a new profile entry.
+A maintained Windows CI job that runs the new Windows resize e2e in the sig-windows periodic suite.

@@ -41,6 +41,9 @@ feature-gates:
       - kube-apiserver
       - kube-scheduler
       - kubelet
+  - name: WindowsInPlacePodResize
+    components:
+      - kubelet
 disable-supported: true
 
 metrics:
