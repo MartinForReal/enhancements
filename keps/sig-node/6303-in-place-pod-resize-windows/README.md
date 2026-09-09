@@ -362,7 +362,8 @@ resize policies are actively issuing there.
 
 - Resize refused when the gate is on: check kubelet events for runtime capability/unsupported reason; confirm
   WindowsInPlacePodResize is enabled.
-- Memory limit decrease at/above committed usage: expect allocation failure / unhealthy and the documented event.
+- If committed usage is at or above the requested memory limit, the existing limit remains applied and the
+  resize is retried. After a successful decrease, subsequent allocations that exceed the new cap can fail.
 
 ## Implementation History
 
@@ -374,6 +375,8 @@ resize policies are actively issuing there.
 - 2026-09-09 (b): second review pass - add a Windows-specific branch to bypass cgroup CPUShares/CPUQuota requirements in
   the reconciliation path; preserve the resize validator so a below-usage memory decrease stays unapplied and is retried;
   regenerate the table of contents (alpha-v138 / beta-v139 / ga-v141 anchors).
+- 2026-09-09 (c): final editorial pass - align the troubleshooting guidance with the corrected memory-decrease
+  behavior (below-usage decrease is retried, not applied; allocation failure only after a successful decrease).
 - Tracking issue: kubernetes/enhancements#6303.
 
 ## Drawbacks
